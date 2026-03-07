@@ -12,6 +12,11 @@ from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+
+try:
+    import sglang.srt.distributed.device_communicators.pcie_allreduce as pcie_ops
+except Exception:
+    pcie_ops = None
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -144,12 +149,20 @@ class CustomAllreduce:
             full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
         if world_size > 2 and not full_nvlink:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
-            )
-            return
+            if _is_cuda:
+                log_info_on_rank0(
+                    logger,
+                    "PCIe topology detected with P2P support. "
+                    "Enabling oneshot custom allreduce for small messages.",
+                )
+                max_size = min(max_size, 64 * 1024)
+            else:
+                logger.warning(
+                    "Custom allreduce is disabled because it's not supported on"
+                    " more than two PCIe-only GPUs. To silence this warning, "
+                    "specify disable_custom_all_reduce=True explicitly."
+                )
+                return
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -171,11 +184,13 @@ class CustomAllreduce:
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
+            self._ops = pcie_ops if not self.full_nvlink else ops
             self.meta_ptrs = self.create_shared_buffer(
-                ops.meta_size() + max_size, group=group
+                self._ops.meta_size() + max_size, group=group
             )
-            # This is a pre-registered IPC buffer. In eager mode, input tensors
-            # are first copied into this buffer before allreduce is performed
+            # Pre-registered IPC buffer(s). In eager mode, input tensors
+            # are first copied into this buffer before allreduce is performed.
+            # For PCIe, we double-buffer to eliminate the end barrier.
             self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
             # This is a buffer for storing the tuples of pointers pointing to
             # IPC buffers from all ranks. Each registered tuple has size of
@@ -185,10 +200,26 @@ class CustomAllreduce:
             self.rank_data = torch.empty(
                 max_size, dtype=torch.uint8, device=self.device
             )
-            self._ptr = ops.init_custom_ar(
-                self.meta_ptrs, self.rank_data, rank, self.full_nvlink
-            )
-            ops.register_buffer(self._ptr, self.buffer_ptrs)
+            if not self.full_nvlink:
+                log_info_on_rank0(
+                    logger,
+                    f"Using pcie_allreduce backend (max_size={max_size}, "
+                    f"world_size={world_size}, double-buffered).",
+                )
+                self._ptr = pcie_ops.init_custom_ar(
+                    self.meta_ptrs, self.rank_data, rank
+                )
+                self.buffer_ptrs_1 = self.create_shared_buffer(
+                    max_size, group=group
+                )
+                pcie_ops.register_pcie_buffers(
+                    self._ptr, self.buffer_ptrs, self.buffer_ptrs_1
+                )
+            else:
+                self._ptr = ops.init_custom_ar(
+                    self.meta_ptrs, self.rank_data, rank, self.full_nvlink
+                )
+                ops.register_buffer(self._ptr, self.buffer_ptrs)
         else:
             # meta data buffers need to be "uncached" for signal on MI200
             self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
@@ -306,7 +337,7 @@ class CustomAllreduce:
             log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             ops.register_graph_buffers(self._ptr, handles, offsets)
         else:
-            handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
+            handle, offset = self._ops.get_graph_buffer_ipc_meta(self._ptr)
             log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             # We cannot directly use `dist.all_gather_object` here
             # because it is incompatible with `gloo` backend under inference mode.
@@ -320,10 +351,9 @@ class CustomAllreduce:
                 dist.broadcast_object_list(
                     all_data[i], src=rank, group=self.group, device="cpu"
                 )
-            # Unpack list of tuples to tuple of lists.
             handles = [d[0] for d in all_data]  # type: ignore
             offsets = [d[1] for d in all_data]  # type: ignore
-            ops.register_graph_buffers(self._ptr, handles, offsets)
+            self._ops.register_graph_buffers(self._ptr, handles, offsets)
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
@@ -334,12 +364,12 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
         if not _is_hip:
             if self.world_size == 2 or self.full_nvlink:
                 return inp_size <= self.max_size
-            return False
+            # PCIe with P2P: oneshot 1-stage is faster than NCCL for small
+            # messages where kernel launch overhead dominates.
+            return inp_size <= self.max_size
 
         if _is_hip:
             if self.full_nvlink:
@@ -378,10 +408,10 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
-        if registered:
-            ops.all_reduce(self._ptr, inp, out, 0, 0)
+        if registered or not self.full_nvlink:
+            self._ops.all_reduce(self._ptr, inp, out, 0, 0)
         else:
-            ops.all_reduce(
+            self._ops.all_reduce(
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
         return out
@@ -442,10 +472,12 @@ class CustomAllreduce:
 
     def close(self):
         if not self.disabled and self._ptr:
-            ops.dispose(self._ptr)
+            self._ops.dispose(self._ptr)
             if _is_cuda:
                 self.free_shared_buffer(self.meta_ptrs)
                 self.free_shared_buffer(self.buffer_ptrs)
+                if hasattr(self, "buffer_ptrs_1"):
+                    self.free_shared_buffer(self.buffer_ptrs_1)
             self._ptr = 0
 
     def __del__(self):
