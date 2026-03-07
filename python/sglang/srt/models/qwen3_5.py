@@ -383,12 +383,14 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             forward_batch
         )
 
+        is_moe = isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
         should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            not is_moe
+            and self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+        if is_moe:
             hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
         else:
             hidden_states = self.mlp(
@@ -630,12 +632,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch
         )
 
+        is_moe = isinstance(self.mlp, Qwen2MoeSparseMoeBlock)
         should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            not is_moe
+            and self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
+        if is_moe:
             hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
         else:
             hidden_states = self.mlp(

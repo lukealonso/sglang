@@ -3,6 +3,7 @@
 import ctypes
 import logging
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, List, Optional, Union
 
@@ -12,6 +13,11 @@ from torch.distributed import ProcessGroup
 
 import sglang.srt.distributed.device_communicators.custom_all_reduce_ops as ops
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+
+try:
+    import sglang.srt.distributed.device_communicators.pcie_allreduce as pcie_ops
+except Exception:
+    pcie_ops = None
 from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     gpu_p2p_access_check,
@@ -35,6 +41,13 @@ _is_musa = is_musa()
 logger = logging.getLogger(__name__)
 
 
+_SUPPORTED_FUSED_RMSNORM_WEIGHT_DTYPES = {
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+}
+
+
 def _can_p2p(rank: int, world_size: int) -> bool:
     # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
     SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"
@@ -47,6 +60,21 @@ def _can_p2p(rank: int, world_size: int) -> bool:
         if not gpu_p2p_access_check(rank, i):
             return False
     return True
+
+
+_PCIE_BENCHMARK_CEILING = 1024 * 1024  # 1MB upper bound for crossover sweep.
+
+
+def parse_pcie_ar_max_size(value: str) -> Optional[int]:
+    """Parse --pcie-oneshot-allreduce-max-size into bytes, or None for 'auto'."""
+    if value.lower() == "auto":
+        return None
+    v = value.upper().strip()
+    suffixes = {"K": 1024, "KB": 1024, "M": 1024 * 1024, "MB": 1024 * 1024}
+    for suffix, mult in sorted(suffixes.items(), key=lambda x: -len(x[0])):
+        if v.endswith(suffix):
+            return int(v[: -len(suffix)]) * mult
+    return int(value)
 
 
 class CustomAllreduce:
@@ -144,12 +172,32 @@ class CustomAllreduce:
             full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
         if world_size > 2 and not full_nvlink:
-            logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
-            )
-            return
+            from sglang.srt.server_args import get_global_server_args
+
+            sa = get_global_server_args()
+            if _is_cuda and sa.enable_pcie_oneshot_allreduce:
+                explicit_size = parse_pcie_ar_max_size(
+                    sa.pcie_oneshot_allreduce_max_size
+                )
+                if explicit_size is not None:
+                    max_size = min(max_size, explicit_size)
+                    self._needs_crossover_bench = False
+                else:
+                    max_size = min(max_size, _PCIE_BENCHMARK_CEILING)
+                    self._needs_crossover_bench = True
+
+                log_info_on_rank0(
+                    logger,
+                    "PCIe oneshot allreduce enabled "
+                    f"(max_size={'auto' if self._needs_crossover_bench else max_size}).",
+                )
+            else:
+                logger.warning(
+                    "Custom allreduce is disabled because it's not supported on"
+                    " more than two PCIe-only GPUs. To silence this warning, "
+                    "specify disable_custom_all_reduce=True explicitly."
+                )
+                return
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -171,11 +219,13 @@ class CustomAllreduce:
             # Buffers memory are owned by this Python class and passed to C++.
             # Meta data composes of two parts: meta data for synchronization and a
             # temporary buffer for storing intermediate allreduce results.
+            self._ops = pcie_ops if not self.full_nvlink else ops
             self.meta_ptrs = self.create_shared_buffer(
-                ops.meta_size() + max_size, group=group
+                self._ops.meta_size() + max_size, group=group
             )
-            # This is a pre-registered IPC buffer. In eager mode, input tensors
-            # are first copied into this buffer before allreduce is performed
+            # Pre-registered IPC buffer(s). In eager mode, input tensors
+            # are first copied into this buffer before allreduce is performed.
+            # For PCIe, we double-buffer to eliminate the end barrier.
             self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
             # This is a buffer for storing the tuples of pointers pointing to
             # IPC buffers from all ranks. Each registered tuple has size of
@@ -185,10 +235,26 @@ class CustomAllreduce:
             self.rank_data = torch.empty(
                 max_size, dtype=torch.uint8, device=self.device
             )
-            self._ptr = ops.init_custom_ar(
-                self.meta_ptrs, self.rank_data, rank, self.full_nvlink
-            )
-            ops.register_buffer(self._ptr, self.buffer_ptrs)
+            if not self.full_nvlink:
+                log_info_on_rank0(
+                    logger,
+                    f"Using pcie_allreduce backend (max_size={max_size}, "
+                    f"world_size={world_size}, double-buffered).",
+                )
+                self._ptr = pcie_ops.init_custom_ar(
+                    self.meta_ptrs, self.rank_data, rank
+                )
+                self.buffer_ptrs_1 = self.create_shared_buffer(
+                    max_size, group=group
+                )
+                pcie_ops.register_pcie_buffers(
+                    self._ptr, self.buffer_ptrs, self.buffer_ptrs_1
+                )
+            else:
+                self._ptr = ops.init_custom_ar(
+                    self.meta_ptrs, self.rank_data, rank, self.full_nvlink
+                )
+                ops.register_buffer(self._ptr, self.buffer_ptrs)
         else:
             # meta data buffers need to be "uncached" for signal on MI200
             self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
@@ -210,6 +276,10 @@ class CustomAllreduce:
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        self._logged_fused_rmsnorm = False
+        self._logged_fused_gemma_rmsnorm = False
+        self._logged_fused_rmsnorm_skip = False
+        self._logged_fused_gemma_rmsnorm_skip = False
 
     @staticmethod
     def create_shared_buffer(
@@ -306,7 +376,7 @@ class CustomAllreduce:
             log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             ops.register_graph_buffers(self._ptr, handles, offsets)
         else:
-            handle, offset = ops.get_graph_buffer_ipc_meta(self._ptr)
+            handle, offset = self._ops.get_graph_buffer_ipc_meta(self._ptr)
             log_info_on_rank0(logger, f"Registering {len(offset)} cuda graph addresses")
             # We cannot directly use `dist.all_gather_object` here
             # because it is incompatible with `gloo` backend under inference mode.
@@ -320,10 +390,9 @@ class CustomAllreduce:
                 dist.broadcast_object_list(
                     all_data[i], src=rank, group=self.group, device="cpu"
                 )
-            # Unpack list of tuples to tuple of lists.
             handles = [d[0] for d in all_data]  # type: ignore
             offsets = [d[1] for d in all_data]  # type: ignore
-            ops.register_graph_buffers(self._ptr, handles, offsets)
+            self._ops.register_graph_buffers(self._ptr, handles, offsets)
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
@@ -334,12 +403,12 @@ class CustomAllreduce:
             return False
         if not is_weak_contiguous(inp):
             return False
-        # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
         if not _is_hip:
             if self.world_size == 2 or self.full_nvlink:
                 return inp_size <= self.max_size
-            return False
+            # PCIe with P2P: oneshot 1-stage is faster than NCCL for small
+            # messages where kernel launch overhead dominates.
+            return inp_size <= self.max_size
 
         if _is_hip:
             if self.full_nvlink:
@@ -347,6 +416,85 @@ class CustomAllreduce:
             return False
 
         return False
+
+    def find_crossover_size(self, nccl_group) -> int:
+        """Benchmark custom AR vs NCCL at doubling sizes to find the crossover.
+
+        Sets self.max_size to the largest message size (bytes) where custom AR
+        is still faster than NCCL. All ranks must call this collectively.
+        """
+        WARMUP = 50
+        ITERS = 200
+
+        sizes = []
+        b = 1024
+        while b <= _PCIE_BENCHMARK_CEILING:
+            sizes.append(b)
+            b *= 2
+
+        dev = self.device
+        results = []
+
+        for size_bytes in sizes:
+            numel = size_bytes // 2  # bf16
+            inp = torch.ones(numel, dtype=torch.bfloat16, device=dev)
+            out = torch.zeros_like(inp)
+
+            for _ in range(WARMUP):
+                self.all_reduce(inp, out=out)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(ITERS):
+                self.all_reduce(inp, out=out)
+            torch.cuda.synchronize()
+            custom_us = (time.perf_counter() - t0) / ITERS * 1e6
+
+            inp2 = torch.ones(numel, dtype=torch.bfloat16, device=dev)
+            for _ in range(WARMUP):
+                dist.all_reduce(inp2, group=nccl_group)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(ITERS):
+                dist.all_reduce(inp2, group=nccl_group)
+            torch.cuda.synchronize()
+            nccl_us = (time.perf_counter() - t0) / ITERS * 1e6
+
+            winner = "custom" if custom_us < nccl_us else "NCCL"
+            results.append((size_bytes, custom_us, nccl_us, winner))
+
+        crossover = 0
+        for size_bytes, custom_us, nccl_us, winner in results:
+            if winner == "custom":
+                crossover = size_bytes
+        if crossover == 0:
+            crossover = 1024
+
+        self.max_size = crossover
+
+        def fmt_size(b):
+            if b >= 1024 * 1024:
+                return f"{b // (1024*1024)}MB"
+            if b >= 1024:
+                return f"{b // 1024}KB"
+            return f"{b}B"
+
+        if self.rank == 0:
+            lines = [
+                f"[PCIe oneshot allreduce] Crossover benchmark "
+                f"({self.world_size} GPUs, bf16):"
+            ]
+            for size_bytes, custom_us, nccl_us, winner in results:
+                lines.append(
+                    f"  {fmt_size(size_bytes):>6s}:  custom {custom_us:6.1f} us  "
+                    f"vs  NCCL {nccl_us:6.1f} us  -> {winner} wins"
+                )
+            lines.append(
+                f"  Setting max_size = {fmt_size(crossover)} "
+                f"(last size where custom AR wins)"
+            )
+            log_info_on_rank0(logger, "\n".join(lines))
+
+        return crossover
 
     # all reduce, assuming inp tensor is IPC registered with register_buffer,
     # or, in the context of cuda graphs, register_graph_buffers
@@ -378,13 +526,143 @@ class CustomAllreduce:
         """
         if out is None:
             out = torch.empty_like(inp)
-        if registered:
-            ops.all_reduce(self._ptr, inp, out, 0, 0)
+        if registered or not self.full_nvlink:
+            self._ops.all_reduce(self._ptr, inp, out, 0, 0)
         else:
-            ops.all_reduce(
+            self._ops.all_reduce(
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
         return out
+
+    def fused_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Optional[tuple]:
+        if self.full_nvlink or pcie_ops is None:
+            if not self._logged_fused_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + RMSNorm because "
+                    f"full_nvlink={self.full_nvlink}, pcie_ops_available={pcie_ops is not None}.",
+                )
+                self._logged_fused_rmsnorm_skip = True
+            return None
+        if weight.dtype not in _SUPPORTED_FUSED_RMSNORM_WEIGHT_DTYPES:
+            if not self._logged_fused_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + RMSNorm because "
+                    f"weight_dtype={weight.dtype}.",
+                )
+                self._logged_fused_rmsnorm_skip = True
+            return None
+        if not self.should_custom_ar(inp):
+            if not self._logged_fused_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + RMSNorm because "
+                    f"should_custom_ar=False for shape={tuple(inp.shape)}, dtype={inp.dtype}.",
+                )
+                self._logged_fused_rmsnorm_skip = True
+            return None
+        if inp.dim() == 1:
+            inp = inp.unsqueeze(0)
+            residual = residual.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(inp)
+        if not self._logged_fused_rmsnorm:
+            log_info_on_rank0(
+                logger,
+                "Using fused PCIe allreduce + RMSNorm "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, weight_dtype={weight.dtype}).",
+            )
+            self._logged_fused_rmsnorm = True
+        pcie_ops.allreduce_rmsnorm(
+            self._ptr,
+            inp,
+            residual,
+            out,
+            residual_out,
+            weight,
+            eps,
+            self.buffer_ptrs[self.rank] if self.full_nvlink else 0,
+            self.max_size if self.full_nvlink else 0,
+        )
+        if squeeze:
+            out = out.squeeze(0)
+            residual_out = residual_out.squeeze(0)
+        return out, residual_out
+
+    def fused_allreduce_gemma_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Optional[tuple]:
+        if self.full_nvlink or pcie_ops is None:
+            if not self._logged_fused_gemma_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + GemmaRMSNorm because "
+                    f"full_nvlink={self.full_nvlink}, pcie_ops_available={pcie_ops is not None}.",
+                )
+                self._logged_fused_gemma_rmsnorm_skip = True
+            return None
+        if weight.dtype not in _SUPPORTED_FUSED_RMSNORM_WEIGHT_DTYPES:
+            if not self._logged_fused_gemma_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + GemmaRMSNorm because "
+                    f"weight_dtype={weight.dtype}.",
+                )
+                self._logged_fused_gemma_rmsnorm_skip = True
+            return None
+        if not self.should_custom_ar(inp):
+            if not self._logged_fused_gemma_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + GemmaRMSNorm because "
+                    f"should_custom_ar=False for shape={tuple(inp.shape)}, dtype={inp.dtype}.",
+                )
+                self._logged_fused_gemma_rmsnorm_skip = True
+            return None
+        if inp.dim() == 1:
+            inp = inp.unsqueeze(0)
+            residual = residual.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(inp)
+        if not self._logged_fused_gemma_rmsnorm:
+            log_info_on_rank0(
+                logger,
+                "Using fused PCIe allreduce + GemmaRMSNorm "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, weight_dtype={weight.dtype}).",
+            )
+            self._logged_fused_gemma_rmsnorm = True
+        pcie_ops.allreduce_gemma_rmsnorm(
+            self._ptr,
+            inp,
+            residual,
+            out,
+            residual_out,
+            weight,
+            eps,
+            self.buffer_ptrs[self.rank] if self.full_nvlink else 0,
+            self.max_size if self.full_nvlink else 0,
+        )
+        if squeeze:
+            out = out.squeeze(0)
+            residual_out = residual_out.squeeze(0)
+        return out, residual_out
 
     def deterministic_all_reduce(
         self,
@@ -442,10 +720,12 @@ class CustomAllreduce:
 
     def close(self):
         if not self.disabled and self._ptr:
-            ops.dispose(self._ptr)
+            self._ops.dispose(self._ptr)
             if _is_cuda:
                 self.free_shared_buffer(self.meta_ptrs)
                 self.free_shared_buffer(self.buffer_ptrs)
+                if hasattr(self, "buffer_ptrs_1"):
+                    self.free_shared_buffer(self.buffer_ptrs_1)
             self._ptr = 0
 
     def __del__(self):
