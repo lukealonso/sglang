@@ -40,6 +40,13 @@ _is_musa = is_musa()
 logger = logging.getLogger(__name__)
 
 
+_SUPPORTED_FUSED_RMSNORM_WEIGHT_DTYPES = {
+    torch.float32,
+    torch.float16,
+    torch.bfloat16,
+}
+
+
 def _can_p2p(rank: int, world_size: int) -> bool:
     # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
     SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"
@@ -241,6 +248,10 @@ class CustomAllreduce:
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        self._logged_fused_rmsnorm = False
+        self._logged_fused_gemma_rmsnorm = False
+        self._logged_fused_rmsnorm_skip = False
+        self._logged_fused_gemma_rmsnorm_skip = False
 
     @staticmethod
     def create_shared_buffer(
@@ -415,6 +426,136 @@ class CustomAllreduce:
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
         return out
+
+    def fused_allreduce_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Optional[tuple]:
+        if self.full_nvlink or pcie_ops is None:
+            if not self._logged_fused_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + RMSNorm because "
+                    f"full_nvlink={self.full_nvlink}, pcie_ops_available={pcie_ops is not None}.",
+                )
+                self._logged_fused_rmsnorm_skip = True
+            return None
+        if weight.dtype not in _SUPPORTED_FUSED_RMSNORM_WEIGHT_DTYPES:
+            if not self._logged_fused_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + RMSNorm because "
+                    f"weight_dtype={weight.dtype}.",
+                )
+                self._logged_fused_rmsnorm_skip = True
+            return None
+        if not self.should_custom_ar(inp):
+            if not self._logged_fused_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + RMSNorm because "
+                    f"should_custom_ar=False for shape={tuple(inp.shape)}, dtype={inp.dtype}.",
+                )
+                self._logged_fused_rmsnorm_skip = True
+            return None
+        if inp.dim() == 1:
+            inp = inp.unsqueeze(0)
+            residual = residual.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(inp)
+        if not self._logged_fused_rmsnorm:
+            log_info_on_rank0(
+                logger,
+                "Using fused PCIe allreduce + RMSNorm "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, weight_dtype={weight.dtype}).",
+            )
+            self._logged_fused_rmsnorm = True
+        pcie_ops.allreduce_rmsnorm(
+            self._ptr,
+            inp,
+            residual,
+            out,
+            residual_out,
+            weight,
+            eps,
+            self.buffer_ptrs[self.rank] if self.full_nvlink else 0,
+            self.max_size if self.full_nvlink else 0,
+        )
+        if squeeze:
+            out = out.squeeze(0)
+            residual_out = residual_out.squeeze(0)
+        return out, residual_out
+
+    def fused_allreduce_gemma_rmsnorm(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> Optional[tuple]:
+        if self.full_nvlink or pcie_ops is None:
+            if not self._logged_fused_gemma_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + GemmaRMSNorm because "
+                    f"full_nvlink={self.full_nvlink}, pcie_ops_available={pcie_ops is not None}.",
+                )
+                self._logged_fused_gemma_rmsnorm_skip = True
+            return None
+        if weight.dtype not in _SUPPORTED_FUSED_RMSNORM_WEIGHT_DTYPES:
+            if not self._logged_fused_gemma_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + GemmaRMSNorm because "
+                    f"weight_dtype={weight.dtype}.",
+                )
+                self._logged_fused_gemma_rmsnorm_skip = True
+            return None
+        if not self.should_custom_ar(inp):
+            if not self._logged_fused_gemma_rmsnorm_skip:
+                log_info_on_rank0(
+                    logger,
+                    "Skipping fused PCIe allreduce + GemmaRMSNorm because "
+                    f"should_custom_ar=False for shape={tuple(inp.shape)}, dtype={inp.dtype}.",
+                )
+                self._logged_fused_gemma_rmsnorm_skip = True
+            return None
+        if inp.dim() == 1:
+            inp = inp.unsqueeze(0)
+            residual = residual.unsqueeze(0)
+            squeeze = True
+        else:
+            squeeze = False
+        out = torch.empty_like(inp)
+        residual_out = torch.empty_like(inp)
+        if not self._logged_fused_gemma_rmsnorm:
+            log_info_on_rank0(
+                logger,
+                "Using fused PCIe allreduce + GemmaRMSNorm "
+                f"(shape={tuple(inp.shape)}, dtype={inp.dtype}, weight_dtype={weight.dtype}).",
+            )
+            self._logged_fused_gemma_rmsnorm = True
+        pcie_ops.allreduce_gemma_rmsnorm(
+            self._ptr,
+            inp,
+            residual,
+            out,
+            residual_out,
+            weight,
+            eps,
+            self.buffer_ptrs[self.rank] if self.full_nvlink else 0,
+            self.max_size if self.full_nvlink else 0,
+        )
+        if squeeze:
+            out = out.squeeze(0)
+            residual_out = residual_out.squeeze(0)
+        return out, residual_out
 
     def deterministic_all_reduce(
         self,

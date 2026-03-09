@@ -71,6 +71,7 @@ struct packed_t {
 
 // ---- Scalar ops ----
 
+DINLINE float upcast_s(float val) { return val; }
 DINLINE float upcast_s(half val) { return __half2float(val); }
 
 template <typename T>
@@ -183,6 +184,81 @@ __global__ void __launch_bounds__(512, 1) pcie_allreduce_kernel(
   multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size; idx += gridDim.x * blockDim.x) {
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>(rotated, idx);
+  }
+}
+
+// ---- Fused PCIe allreduce + residual-add + RMSNorm kernel ----
+// One block per token row. Keeps allreduced values in registers through
+// the normalization, avoiding a global-memory round-trip.
+
+template <typename T, typename W, int ngpus, bool is_gemma>
+__global__ void __launch_bounds__(512, 1) pcie_allreduce_rmsnorm_kernel(
+    RankData* _dp, RankSignals sg, Signal* self_sg,
+    T* __restrict__ output,
+    const T* __restrict__ residual_in,
+    T* __restrict__ residual_out,
+    const W* __restrict__ weight,
+    int rank, int hidden_size, float eps) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  constexpr int kPackSize = P::size;
+
+  auto dp = *_dp;
+  int token = blockIdx.x;
+  int packed_hidden = hidden_size / kPackSize;
+  int row_offset = token * packed_hidden;
+
+  const P* rotated[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; i++) {
+    rotated[i] = (const P*)dp.ptrs[(rank + i) % ngpus] + row_offset;
+  }
+  const P* res_in_row = (const P*)residual_in + row_offset;
+  P* res_out_row = (P*)residual_out + row_offset;
+  const W* weight_row = weight;
+  P* out_row = (P*)output + row_offset;
+
+  multi_gpu_barrier<ngpus, true>(sg, self_sg, rank);
+
+  // Pass 1: allreduce + add residual + write residual_out + accumulate variance.
+  extern __shared__ float smem[];
+  float local_sum_sq = 0.0f;
+
+  for (int idx = threadIdx.x; idx < packed_hidden; idx += blockDim.x) {
+    A acc = upcast(rotated[0][idx]);
+#pragma unroll
+    for (int i = 1; i < ngpus; i++) packed_assign_add(acc, upcast(rotated[i][idx]));
+
+    A res = upcast(res_in_row[idx]);
+#pragma unroll
+    for (int j = 0; j < A::size; j++) {
+      acc.data[j] += res.data[j];
+      local_sum_sq += acc.data[j] * acc.data[j];
+    }
+
+    res_out_row[idx] = downcast<P>(acc);
+  }
+
+  // Block-level tree reduction for sum of squares.
+  smem[threadIdx.x] = local_sum_sq;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) smem[threadIdx.x] += smem[threadIdx.x + s];
+    __syncthreads();
+  }
+  float scale = rsqrtf(smem[0] / hidden_size + eps);
+
+  // Pass 2: re-read residual_out (warm in L2), normalize, write output.
+  for (int idx = threadIdx.x; idx < packed_hidden; idx += blockDim.x) {
+    A val = upcast(res_out_row[idx]);
+    A normed;
+#pragma unroll
+    for (int j = 0; j < A::size; j++) {
+      float w = upcast_s(weight_row[idx * kPackSize + j]);
+      float gamma = is_gemma ? (1.0f + w) : w;
+      normed.data[j] = val.data[j] * scale * gamma;
+    }
+    out_row[idx] = downcast<P>(normed);
   }
 }
 
@@ -349,6 +425,102 @@ class PCIeAllreduce {
 #undef KL
   }
 
+  template <typename T, typename W>
+  void allreduce_rmsnorm(
+      cudaStream_t stream, T* input, T* residual_in, T* output, T* residual_out,
+      const W* weight, int num_tokens, int hidden_size, float eps, int threads = 512) {
+    auto d = packed_t<T>::P::size;
+    if (hidden_size % d != 0)
+      throw std::runtime_error("hidden_size must be multiple of " + std::to_string(d));
+    if (num_tokens > kMaxBlocks)
+      throw std::runtime_error("num_tokens (" + std::to_string(num_tokens) + ") exceeds kMaxBlocks (" +
+                               std::to_string(kMaxBlocks) + ")");
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
+
+    int size = num_tokens * hidden_size;
+    if (dbuf_enabled_ && status != cudaStreamCaptureStatusActive) {
+      int slot = dbuf_slot_ % 2;
+      dbuf_slot_++;
+      AT_CUDA_CHECK(cudaMemcpyAsync(dbuf_raw_[slot][rank_], input, size * sizeof(T), cudaMemcpyDeviceToDevice, stream));
+      ptrs = dbuf_rd_[slot];
+    } else if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error("buffer not registered");
+      ptrs = it->second;
+    }
+
+    int blocks = num_tokens;
+    int shmem = threads * sizeof(float);
+
+#define KL_FUSED(ngpus) \
+    pcie_allreduce_rmsnorm_kernel<T, W, ngpus, false><<<blocks, threads, shmem, stream>>>( \
+        ptrs, sg_, self_sg_, output, residual_in, residual_out, weight, rank_, hidden_size, eps);
+    switch (world_size_) {
+      case 2: KL_FUSED(2); break;
+      case 4: KL_FUSED(4); break;
+      case 6: KL_FUSED(6); break;
+      case 8: KL_FUSED(8); break;
+      default:
+        throw std::runtime_error("only supports (2,4,6,8) gpus, got " + std::to_string(world_size_));
+    }
+#undef KL_FUSED
+  }
+
+  template <typename T, typename W>
+  void allreduce_gemma_rmsnorm(
+      cudaStream_t stream, T* input, T* residual_in, T* output, T* residual_out,
+      const W* weight, int num_tokens, int hidden_size, float eps, int threads = 512) {
+    auto d = packed_t<T>::P::size;
+    if (hidden_size % d != 0)
+      throw std::runtime_error("hidden_size must be multiple of " + std::to_string(d));
+    if (num_tokens > kMaxBlocks)
+      throw std::runtime_error("num_tokens (" + std::to_string(num_tokens) + ") exceeds kMaxBlocks (" +
+                               std::to_string(kMaxBlocks) + ")");
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CHECK_CUDA_SUCCESS(cudaStreamIsCapturing(stream, &status));
+
+    int size = num_tokens * hidden_size;
+    if (dbuf_enabled_ && status != cudaStreamCaptureStatusActive) {
+      int slot = dbuf_slot_ % 2;
+      dbuf_slot_++;
+      AT_CUDA_CHECK(cudaMemcpyAsync(dbuf_raw_[slot][rank_], input, size * sizeof(T), cudaMemcpyDeviceToDevice, stream));
+      ptrs = dbuf_rd_[slot];
+    } else if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error("buffer not registered");
+      ptrs = it->second;
+    }
+
+    int blocks = num_tokens;
+    int shmem = threads * sizeof(float);
+
+#define KL_GEMMA_FUSED(ngpus) \
+    pcie_allreduce_rmsnorm_kernel<T, W, ngpus, true><<<blocks, threads, shmem, stream>>>( \
+        ptrs, sg_, self_sg_, output, residual_in, residual_out, weight, rank_, hidden_size, eps);
+    switch (world_size_) {
+      case 2: KL_GEMMA_FUSED(2); break;
+      case 4: KL_GEMMA_FUSED(4); break;
+      case 6: KL_GEMMA_FUSED(6); break;
+      case 8: KL_GEMMA_FUSED(8); break;
+      default:
+        throw std::runtime_error("only supports (2,4,6,8) gpus, got " + std::to_string(world_size_));
+    }
+#undef KL_GEMMA_FUSED
+  }
+
   ~PCIeAllreduce() {
     for (auto [_, ptr] : ipc_handles_) CHECK_CUDA_SUCCESS(cudaIpcCloseMemHandle(ptr));
   }
@@ -465,6 +637,236 @@ static void register_graph_buffers(
   fa->register_graph_buffers(bytes, offsets);
 }
 
+static void allreduce_rmsnorm(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual_in,
+    torch::Tensor& out, torch::Tensor& residual_out,
+    torch::Tensor& weight, double eps,
+    fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), residual_in.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), residual_out.scalar_type());
+  TORCH_CHECK(inp.dim() == 2, "input must be [num_tokens, hidden_size]");
+  TORCH_CHECK(weight.dim() == 1, "weight must be [hidden_size]");
+  int num_tokens = inp.size(0);
+  int hidden_size = inp.size(1);
+  TORCH_CHECK_EQ(weight.size(0), hidden_size);
+  TORCH_CHECK(_is_weak_contiguous(weight));
+
+  void* reg_buffer;
+  if (fa->dbuf_enabled_) {
+    reg_buffer = inp.data_ptr();
+  } else if (_reg_buffer) {
+    auto input_size = inp.numel() * inp.element_size();
+    reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream));
+  } else {
+    reg_buffer = inp.data_ptr();
+  }
+
+  switch (out.scalar_type()) {
+    case at::ScalarType::Half:
+      switch (weight.scalar_type()) {
+        case at::ScalarType::Float:
+          fa->allreduce_rmsnorm<half, float>(
+              stream, (half*)reg_buffer, (half*)residual_in.data_ptr(),
+              (half*)out.data_ptr(), (half*)residual_out.data_ptr(),
+              (const float*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        case at::ScalarType::Half:
+          fa->allreduce_rmsnorm<half, half>(
+              stream, (half*)reg_buffer, (half*)residual_in.data_ptr(),
+              (half*)out.data_ptr(), (half*)residual_out.data_ptr(),
+              (const half*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+        case at::ScalarType::BFloat16:
+          fa->allreduce_rmsnorm<half, nv_bfloat16>(
+              stream, (half*)reg_buffer, (half*)residual_in.data_ptr(),
+              (half*)out.data_ptr(), (half*)residual_out.data_ptr(),
+              (const nv_bfloat16*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+#endif
+        default:
+          throw std::runtime_error("allreduce_rmsnorm: unsupported weight dtype");
+      }
+      break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case at::ScalarType::BFloat16:
+      switch (weight.scalar_type()) {
+        case at::ScalarType::Float:
+          fa->allreduce_rmsnorm<nv_bfloat16, float>(
+              stream, (nv_bfloat16*)reg_buffer, (nv_bfloat16*)residual_in.data_ptr(),
+              (nv_bfloat16*)out.data_ptr(), (nv_bfloat16*)residual_out.data_ptr(),
+              (const float*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        case at::ScalarType::Half:
+          fa->allreduce_rmsnorm<nv_bfloat16, half>(
+              stream, (nv_bfloat16*)reg_buffer, (nv_bfloat16*)residual_in.data_ptr(),
+              (nv_bfloat16*)out.data_ptr(), (nv_bfloat16*)residual_out.data_ptr(),
+              (const half*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        case at::ScalarType::BFloat16:
+          fa->allreduce_rmsnorm<nv_bfloat16, nv_bfloat16>(
+              stream, (nv_bfloat16*)reg_buffer, (nv_bfloat16*)residual_in.data_ptr(),
+              (nv_bfloat16*)out.data_ptr(), (nv_bfloat16*)residual_out.data_ptr(),
+              (const nv_bfloat16*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        default:
+          throw std::runtime_error("allreduce_rmsnorm: unsupported weight dtype");
+      }
+      break;
+#endif
+    case at::ScalarType::Float:
+      switch (weight.scalar_type()) {
+        case at::ScalarType::Float:
+          fa->allreduce_rmsnorm<float, float>(
+              stream, (float*)reg_buffer, (float*)residual_in.data_ptr(),
+              (float*)out.data_ptr(), (float*)residual_out.data_ptr(),
+              (const float*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        case at::ScalarType::Half:
+          fa->allreduce_rmsnorm<float, half>(
+              stream, (float*)reg_buffer, (float*)residual_in.data_ptr(),
+              (float*)out.data_ptr(), (float*)residual_out.data_ptr(),
+              (const half*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+        case at::ScalarType::BFloat16:
+          fa->allreduce_rmsnorm<float, nv_bfloat16>(
+              stream, (float*)reg_buffer, (float*)residual_in.data_ptr(),
+              (float*)out.data_ptr(), (float*)residual_out.data_ptr(),
+              (const nv_bfloat16*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+#endif
+        default:
+          throw std::runtime_error("allreduce_rmsnorm: unsupported weight dtype");
+      }
+      break;
+    default:
+      throw std::runtime_error("allreduce_rmsnorm: unsupported dtype");
+  }
+}
+
+static void allreduce_gemma_rmsnorm(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual_in,
+    torch::Tensor& out, torch::Tensor& residual_out,
+    torch::Tensor& weight, double eps,
+    fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
+  auto fa = reinterpret_cast<pcie_allreduce::PCIeAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(inp.scalar_type(), out.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), residual_in.scalar_type());
+  TORCH_CHECK_EQ(inp.scalar_type(), residual_out.scalar_type());
+  TORCH_CHECK(inp.dim() == 2, "input must be [num_tokens, hidden_size]");
+  TORCH_CHECK(weight.dim() == 1, "weight must be [hidden_size]");
+  int num_tokens = inp.size(0);
+  int hidden_size = inp.size(1);
+  TORCH_CHECK_EQ(weight.size(0), hidden_size);
+  TORCH_CHECK(_is_weak_contiguous(weight));
+
+  void* reg_buffer;
+  if (fa->dbuf_enabled_) {
+    reg_buffer = inp.data_ptr();
+  } else if (_reg_buffer) {
+    auto input_size = inp.numel() * inp.element_size();
+    reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size, cudaMemcpyDeviceToDevice, stream));
+  } else {
+    reg_buffer = inp.data_ptr();
+  }
+
+  switch (out.scalar_type()) {
+    case at::ScalarType::Half:
+      switch (weight.scalar_type()) {
+        case at::ScalarType::Float:
+          fa->allreduce_gemma_rmsnorm<half, float>(
+              stream, (half*)reg_buffer, (half*)residual_in.data_ptr(),
+              (half*)out.data_ptr(), (half*)residual_out.data_ptr(),
+              (const float*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        case at::ScalarType::Half:
+          fa->allreduce_gemma_rmsnorm<half, half>(
+              stream, (half*)reg_buffer, (half*)residual_in.data_ptr(),
+              (half*)out.data_ptr(), (half*)residual_out.data_ptr(),
+              (const half*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+        case at::ScalarType::BFloat16:
+          fa->allreduce_gemma_rmsnorm<half, nv_bfloat16>(
+              stream, (half*)reg_buffer, (half*)residual_in.data_ptr(),
+              (half*)out.data_ptr(), (half*)residual_out.data_ptr(),
+              (const nv_bfloat16*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+#endif
+        default:
+          throw std::runtime_error("allreduce_gemma_rmsnorm: unsupported weight dtype");
+      }
+      break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+    case at::ScalarType::BFloat16:
+      switch (weight.scalar_type()) {
+        case at::ScalarType::Float:
+          fa->allreduce_gemma_rmsnorm<nv_bfloat16, float>(
+              stream, (nv_bfloat16*)reg_buffer, (nv_bfloat16*)residual_in.data_ptr(),
+              (nv_bfloat16*)out.data_ptr(), (nv_bfloat16*)residual_out.data_ptr(),
+              (const float*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        case at::ScalarType::Half:
+          fa->allreduce_gemma_rmsnorm<nv_bfloat16, half>(
+              stream, (nv_bfloat16*)reg_buffer, (nv_bfloat16*)residual_in.data_ptr(),
+              (nv_bfloat16*)out.data_ptr(), (nv_bfloat16*)residual_out.data_ptr(),
+              (const half*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        case at::ScalarType::BFloat16:
+          fa->allreduce_gemma_rmsnorm<nv_bfloat16, nv_bfloat16>(
+              stream, (nv_bfloat16*)reg_buffer, (nv_bfloat16*)residual_in.data_ptr(),
+              (nv_bfloat16*)out.data_ptr(), (nv_bfloat16*)residual_out.data_ptr(),
+              (const nv_bfloat16*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        default:
+          throw std::runtime_error("allreduce_gemma_rmsnorm: unsupported weight dtype");
+      }
+      break;
+#endif
+    case at::ScalarType::Float:
+      switch (weight.scalar_type()) {
+        case at::ScalarType::Float:
+          fa->allreduce_gemma_rmsnorm<float, float>(
+              stream, (float*)reg_buffer, (float*)residual_in.data_ptr(),
+              (float*)out.data_ptr(), (float*)residual_out.data_ptr(),
+              (const float*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+        case at::ScalarType::Half:
+          fa->allreduce_gemma_rmsnorm<float, half>(
+              stream, (float*)reg_buffer, (float*)residual_in.data_ptr(),
+              (float*)out.data_ptr(), (float*)residual_out.data_ptr(),
+              (const half*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+#if (__CUDA_ARCH__ >= 800 || !defined(__CUDA_ARCH__))
+        case at::ScalarType::BFloat16:
+          fa->allreduce_gemma_rmsnorm<float, nv_bfloat16>(
+              stream, (float*)reg_buffer, (float*)residual_in.data_ptr(),
+              (float*)out.data_ptr(), (float*)residual_out.data_ptr(),
+              (const nv_bfloat16*)weight.data_ptr(), num_tokens, hidden_size, (float)eps);
+          break;
+#endif
+        default:
+          throw std::runtime_error("allreduce_gemma_rmsnorm: unsupported weight dtype");
+      }
+      break;
+    default:
+      throw std::runtime_error("allreduce_gemma_rmsnorm: unsupported dtype");
+  }
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("init_custom_ar", &init_custom_ar, "init PCIe allreduce");
   m.def("all_reduce", &all_reduce, "PCIe allreduce");
@@ -474,4 +876,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("register_pcie_buffers", &register_pcie_buffers, "register double-buffered IPC buffers");
   m.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta, "get graph buffer IPC meta");
   m.def("register_graph_buffers", &register_graph_buffers, "register graph buffers");
+  m.def("allreduce_rmsnorm", &allreduce_rmsnorm, "fused PCIe allreduce + residual-add + RMSNorm");
+  m.def("allreduce_gemma_rmsnorm", &allreduce_gemma_rmsnorm, "fused PCIe allreduce + residual-add + Gemma RMSNorm");
 }

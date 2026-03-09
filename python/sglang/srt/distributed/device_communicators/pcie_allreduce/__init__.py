@@ -27,3 +27,5 @@ register_buffer = _ext.register_buffer
 register_pcie_buffers = _ext.register_pcie_buffers
 get_graph_buffer_ipc_meta = _ext.get_graph_buffer_ipc_meta
 register_graph_buffers = _ext.register_graph_buffers
+allreduce_rmsnorm = _ext.allreduce_rmsnorm
+allreduce_gemma_rmsnorm = _ext.allreduce_gemma_rmsnorm

@@ -117,6 +117,19 @@ def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     )
 
 
+def apply_pcie_allreduce_fusion(batch_size: int):
+    ca_comm = get_tp_group().ca_comm
+    return (
+        _is_cuda
+        and ca_comm is not None
+        and not getattr(ca_comm, "disabled", True)
+        and not getattr(ca_comm, "full_nvlink", True)
+        and batch_size > 0
+        and batch_size <= 36
+        and not is_dp_attention_enabled()
+    )
+
+
 class ScatterMode(Enum):
     """
     Suppose we have TP=4, DP=2, enable-dp-attention, and the system handles seq a,b,c,d
@@ -449,6 +462,7 @@ class LayerCommunicator:
                 if (
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                    or apply_pcie_allreduce_fusion(hidden_states.shape[0])
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
@@ -628,6 +642,7 @@ class LayerCommunicator:
         return (
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
+                or apply_pcie_allreduce_fusion(batch_size)
                 or (
                     _use_aiter
                     and batch_size > 0
@@ -868,6 +883,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             if (
                 apply_aiter_all_reduce_fusion(hidden_states)
                 or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])
+                or apply_pcie_allreduce_fusion(hidden_states.shape[0])
             ) and hasattr(layernorm, "forward_with_allreduce_fusion"):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual

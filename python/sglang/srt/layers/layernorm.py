@@ -337,13 +337,16 @@ class RMSNorm(MultiPlatformOp):
                     if fused_result[0] is not None:
                         return fused_result
 
-                # For AITER route, preserve correctness when fused path is unavailable.
-                if (
-                    _use_aiter
-                    and get_global_server_args().enable_aiter_allreduce_fusion
-                ):
-                    x = tensor_model_parallel_all_reduce(x)
-                    return self.forward(x, residual, None)
+                # PCIe fused allreduce+RMSNorm (routes through ca_comm).
+                fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
+                    x, residual, self.weight, self.variance_epsilon
+                )
+                if fused_result is not None:
+                    return fused_result
+
+                # All fused paths unavailable — allreduce manually before layernorm.
+                x = tensor_model_parallel_all_reduce(x)
+                return self.forward(x, residual, None)
 
         return self.forward(x, residual, post_residual_addition)
 
@@ -421,6 +424,8 @@ class LayerNorm(MultiPlatformOp):
 
 
 class GemmaRMSNorm(MultiPlatformOp):
+    _logged_allreduce_fusion_fallback = False
+
     def __init__(
         self,
         hidden_size: int,
@@ -477,6 +482,41 @@ class GemmaRMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual, post_residual_addition)
+
+    def forward_with_allreduce_fusion(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is not None:
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_reduce,
+                tensor_model_parallel_fused_allreduce_gemma_rmsnorm,
+            )
+
+            if get_tensor_model_parallel_world_size() > 1:
+                if post_residual_addition is not None:
+                    residual = residual + post_residual_addition
+
+                fused_result = tensor_model_parallel_fused_allreduce_gemma_rmsnorm(
+                    x, residual, self.weight, self.variance_epsilon
+                )
+                if fused_result is not None:
+                    return fused_result
+                if not GemmaRMSNorm._logged_allreduce_fusion_fallback:
+                    logger.info(
+                        "GemmaRMSNorm allreduce fusion fell back to unfused path "
+                        "(shape=%s, x_dtype=%s, weight_dtype=%s).",
+                        tuple(x.shape),
+                        x.dtype,
+                        self.weight.dtype,
+                    )
+                    GemmaRMSNorm._logged_allreduce_fusion_fallback = True
+                x = tensor_model_parallel_all_reduce(x)
+
+        return self.forward(x, residual, post_residual_addition)
 
     def forward_cpu(
         self,
