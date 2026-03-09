@@ -11,6 +11,16 @@ import triton.language as tl
 PAD_SLOT_ID = -1
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 8, "BLOCK_N": 128}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 8, "BLOCK_N": 256}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 8, "BLOCK_N": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_M": 16, "BLOCK_N": 256}, num_warps=4, num_stages=2),
+    ],
+    key=["dim", "KERNEL_WIDTH"],
+)
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -544,10 +554,6 @@ def causal_conv1d_fn(
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
-        # launch_cooperative_grid=True
-        BLOCK_M=8,
-        BLOCK_N=256,
-        num_stages=2,
     )
     return out
 
@@ -567,6 +573,16 @@ def causal_conv1d_fn(
 # When calculating token 3's convolution, it should conv to token 1 (parent) and token 0 (grand-parent)
 # When calculating token 2's convolution, it should conv to token 0 (parent)
 # This kernel is a fused kernel which will also produce retrieve_parent_token based on retrieve_next_token & retrieve_next_sibling
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 128}, num_warps=1),
+        triton.Config({"BLOCK_N": 128}, num_warps=2),
+        triton.Config({"BLOCK_N": 256}, num_warps=2),
+        triton.Config({"BLOCK_N": 256}, num_warps=4),
+        triton.Config({"BLOCK_N": 512}, num_warps=4),
+    ],
+    key=["dim", "KERNEL_WIDTH"],
+)
 @triton.jit()
 def _causal_conv1d_update_kernel(
     # Pointers to matrices
@@ -1178,7 +1194,6 @@ def causal_conv1d_update(
         NP2_STATELEN=np2_statelen,
         NP2_SEQLEN=np2_seqlen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
     )

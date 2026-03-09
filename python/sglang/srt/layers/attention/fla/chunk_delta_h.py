@@ -19,16 +19,16 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4]
-#         for num_stages in [2, 3, 4]
-#         for BV in [32, 64]
-#     ],
-#     key=["H", "K", "V", "BT", "USE_G"],
-#     use_cuda_graph=use_cuda_graph,
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BV": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BV": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BV": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BV": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BV": 64}, num_warps=4, num_stages=2),
+    ],
+    key=["K", "V", "BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -327,14 +327,11 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        BV=32,
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
     )
     return h, v_new

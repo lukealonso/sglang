@@ -14,10 +14,15 @@ from sglang.srt.layers.attention.fla.utils import check_shared_mem, input_guard
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
 
-# @triton.autotune(
-#     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-#     key=["B", "H", "BT", "IS_VARLEN", "REVERSE"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ],
+    key=["BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_scalar_kernel(
     s,
@@ -192,8 +197,6 @@ def chunk_local_cumsum_scalar(
         REVERSE=reverse,
         HAS_SCALE=scale is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=8,
-        num_stages=3,
     )
     return g
 

@@ -41,6 +41,19 @@ def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_N": 32}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_N": 64}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_N": 128}, num_warps=8, num_stages=2),
+    ],
+    key=["BLOCK_DMODEL", "BLOCK_DV"],
+)
 @triton.jit
 def _fwd_kernel_stage1(
     Q,
@@ -193,10 +206,6 @@ def _decode_att_m_fwd(
     logit_cap,
     xai_temperature_len=-1,
 ):
-    BLOCK = 64
-    # [TODO] work around SGPR limit on MI3xx
-    if _is_hip:
-        BLOCK = 8
     MAX_KV_SPLITS = max_kv_splits
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
@@ -205,13 +214,6 @@ def _decode_att_m_fwd(
 
     grid = (batch, head_num, MAX_KV_SPLITS)
     kv_group_num = q.shape[1] // k_buffer.shape[1]
-
-    if kv_group_num == 1:
-        num_warps = 4
-    else:
-        num_warps = 2
-        if _is_hip:
-            num_warps = 1
 
     BLOCK_DMODEL = triton.next_power_of_2(Lk)
     BLOCK_DV = triton.next_power_of_2(Lv)
@@ -238,17 +240,28 @@ def _decode_att_m_fwd(
         kv_group_num=kv_group_num,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
-        BLOCK_N=BLOCK,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
-        num_warps=num_warps,
-        num_stages=2,
         Lk=Lk,
         Lv=Lv,
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_N": 32, "BLOCK_H": 16}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_N": 32, "BLOCK_H": 16}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 64, "BLOCK_H": 16}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 64, "BLOCK_H": 16}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_N": 64, "BLOCK_H": 16}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 128, "BLOCK_H": 16}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_N": 128, "BLOCK_H": 16}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_N": 128, "BLOCK_H": 16}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_N": 128, "BLOCK_H": 16}, num_warps=8, num_stages=3),
+    ],
+    key=["BLOCK_DMODEL", "BLOCK_DPE", "BLOCK_DV", "kv_group_num"],
+)
 @triton.jit
 def _fwd_grouped_kernel_stage1(
     Q,
@@ -437,13 +450,8 @@ def _decode_grouped_att_m_fwd(
     logit_cap,
     xai_temperature_len=-1,
 ):
-    BLOCK = 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
-
-    # [TODO] work around shmem limit on MI3xx
-    if _is_hip and Lk >= 576:
-        BLOCK = 16
 
     if Lk == 576:
         BLOCK_DMODEL = 512
@@ -459,21 +467,11 @@ def _decode_grouped_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
-    BLOCK_H = 16
     MAX_KV_SPLITS = max_kv_splits
-    grid = (
-        batch,
-        triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
-        MAX_KV_SPLITS,
-    )
 
-    extra_kargs = {}
-    num_stages = 2
-    if _is_hip:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        num_stages = 1
+    def grid(meta):
+        block_h = min(meta["BLOCK_H"], kv_group_num)
+        return (batch, triton.cdiv(head_num, block_h), MAX_KV_SPLITS)
 
     _fwd_grouped_kernel_stage1[grid](
         q,
@@ -499,19 +497,23 @@ def _decode_grouped_att_m_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
-        BLOCK_N=BLOCK,
-        BLOCK_H=BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
-        num_warps=4,
-        num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
-        **extra_kargs,
     )
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=2, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=1),
+        triton.Config({}, num_warps=8, num_stages=1),
+    ],
+    key=["Lv", "MAX_KV_SPLITS"],
+)
 @triton.jit
 def _fwd_kernel_stage2(
     Mid_O,
@@ -627,8 +629,6 @@ def _decode_softmax_reducev_fwd(
         BLOCK_DV=BLOCK_DV,
         Lv=Lv,
         HAS_SINK=HAS_SINK,
-        num_warps=4,
-        num_stages=2,
         **extra_kargs,
     )
 

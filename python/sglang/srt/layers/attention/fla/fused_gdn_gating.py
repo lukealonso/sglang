@@ -7,6 +7,16 @@ import triton.language as tl
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 # beta_output = b.sigmoid()
+@triton.autotune(
+    configs=[
+        triton.Config({"BLK_HEADS": 8}, num_warps=1),
+        triton.Config({"BLK_HEADS": 16}, num_warps=1),
+        triton.Config({"BLK_HEADS": 16}, num_warps=2),
+        triton.Config({"BLK_HEADS": 32}, num_warps=2),
+        triton.Config({"BLK_HEADS": 32}, num_warps=4),
+    ],
+    key=["NUM_HEADS"],
+)
 @triton.jit
 def fused_gdn_gating_kernel(
     g,
@@ -49,9 +59,12 @@ def fused_gdn_gating(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch, num_heads = a.shape
     seq_len = 1
-    grid = (batch, seq_len, triton.cdiv(num_heads, 8))
     g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
     beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
+
+    def grid(META):
+        return (batch, seq_len, triton.cdiv(num_heads, META["BLK_HEADS"]))
+
     fused_gdn_gating_kernel[grid](
         g,
         beta_output,
@@ -63,7 +76,5 @@ def fused_gdn_gating(
         num_heads,
         beta,
         threshold,
-        8,
-        num_warps=1,
     )
     return g, beta_output

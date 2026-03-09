@@ -12,15 +12,16 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.op import safe_exp
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in [32, 64, 128]
-#         for num_warps in [2, 4, 8]
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["H", "K", "BT", "IS_VARLEN"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 32}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 64}, num_warps=8, num_stages=3),
+        triton.Config({"BK": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 128}, num_warps=8, num_stages=2),
+    ],
+    key=["K", "BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_scaled_dot_kkt_fwd_kernel(
     k,
@@ -138,10 +139,7 @@ def chunk_scaled_dot_kkt_fwd(
         Hg=Hg,
         K=K,
         BT=BT,
-        BK=64,
         IS_VARLEN=cu_seqlens is not None,
         USE_G=g_cumsum is not None,
-        num_warps=8,
-        num_stages=3,
     )
     return A

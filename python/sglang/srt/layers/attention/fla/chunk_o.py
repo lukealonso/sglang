@@ -16,16 +16,17 @@ BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in BKV_LIST
-#         for BV in BKV_LIST
-#         for num_warps in NUM_WARPS
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["H", "K", "V", "BT"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 128, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 128, "BV": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 128, "BV": 64}, num_warps=8, num_stages=2),
+    ],
+    key=["K", "V", "BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
@@ -164,11 +165,7 @@ def chunk_fwd_o(
         K=K,
         V=V,
         BT=BT,
-        BK=128,
-        BV=64,
         USE_G=g is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=2,
     )
     return o

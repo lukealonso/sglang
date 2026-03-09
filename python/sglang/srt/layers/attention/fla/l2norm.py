@@ -14,12 +14,16 @@ from sglang.srt.layers.attention.fla.utils import input_guard
 BT_LIST = [8, 16, 32, 64, 128]
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16, 32]
-#     ],
-#     key=["D"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1),
+        triton.Config({}, num_warps=2),
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+        triton.Config({}, num_warps=16),
+    ],
+    key=["D"],
+)
 @triton.jit
 def l2norm_fwd_kernel1(
     x,
@@ -43,14 +47,17 @@ def l2norm_fwd_kernel1(
     tl.store(y + cols, b_y, mask=mask)
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BT": BT}, num_warps=num_warps)
-#         for num_warps in [1, 2, 4, 8, 16]
-#         for BT in BT_LIST
-#     ],
-#     key=["D", "NB"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BT": 8}, num_warps=4),
+        triton.Config({"BT": 16}, num_warps=4),
+        triton.Config({"BT": 16}, num_warps=8),
+        triton.Config({"BT": 32}, num_warps=4),
+        triton.Config({"BT": 32}, num_warps=8),
+        triton.Config({"BT": 64}, num_warps=8),
+    ],
+    key=["D", "NB"],
+)
 @triton.jit
 def l2norm_fwd_kernel(
     x,
@@ -104,9 +111,6 @@ def l2norm_fwd(
             T=T,
             D=D,
             BD=BD,
-            BT=16,
-            num_warps=8,
-            num_stages=3,
         )
     else:
         l2norm_fwd_kernel1[(T,)](
@@ -115,8 +119,6 @@ def l2norm_fwd(
             eps=eps,
             D=D,
             BD=BD,
-            num_warps=8,
-            num_stages=3,
         )
 
     return y.view(x_shape_og)

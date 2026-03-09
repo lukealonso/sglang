@@ -5,6 +5,18 @@ import triton
 import triton.language as tl
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BV": 16}, num_warps=1, num_stages=3),
+        triton.Config({"BV": 32}, num_warps=1, num_stages=3),
+        triton.Config({"BV": 32}, num_warps=2, num_stages=3),
+        triton.Config({"BV": 64}, num_warps=1, num_stages=3),
+        triton.Config({"BV": 64}, num_warps=2, num_stages=2),
+        triton.Config({"BV": 128}, num_warps=2, num_stages=2),
+        triton.Config({"BV": 128}, num_warps=4, num_stages=2),
+    ],
+    key=["K", "V"],
+)
 @triton.jit(do_not_specialize=["T"])
 def fused_sigmoid_gating_delta_rule_update_kernel(
     A_log,
@@ -280,11 +292,9 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_b = b.stride()[-2]
     HV = v.shape[2]
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
-    BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
-    NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
+    BK = triton.next_power_of_2(K)
+    NK = triton.cdiv(K, BK)
     assert NK == 1, "NK > 1 is not supported yet"
-    num_stages = 3
-    num_warps = 1
 
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -293,7 +303,6 @@ def fused_sigmoid_gating_delta_rule_update(
 
     o = q.new_empty(NK, *v.shape)
 
-    # Prepare retrieve_parent_token strides
     if retrieve_parent_token is not None:
         stride_retrieve_parent_token_seq = retrieve_parent_token.stride(0)
         stride_retrieve_parent_token_token = retrieve_parent_token.stride(1)
@@ -303,7 +312,9 @@ def fused_sigmoid_gating_delta_rule_update(
 
     NP2_T = triton.next_power_of_2(T)
 
-    grid = (NK, NV, N * HV)
+    def grid(META):
+        NV = triton.cdiv(V, META["BV"])
+        return (NK, NV, N * HV)
 
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -338,7 +349,6 @@ def fused_sigmoid_gating_delta_rule_update(
         K=K,
         V=V,
         BK=BK,
-        BV=BV,
         USE_INITIAL_STATE=initial_state_source is not None,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_VARLEN=cu_seqlens is not None,
@@ -346,8 +356,6 @@ def fused_sigmoid_gating_delta_rule_update(
         DISABLE_STATE_UPDATE=disable_state_update,
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
     o = o.squeeze(0)
     return o

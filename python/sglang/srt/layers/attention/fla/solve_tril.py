@@ -12,14 +12,15 @@ from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.utils import input_guard
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [1, 2, 4, 8]
-#         for num_stages in [2, 3, 4, 5]
-#     ],
-#     key=["BT"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=1, num_stages=3),
+        triton.Config({}, num_warps=1, num_stages=4),
+        triton.Config({}, num_warps=2, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=3),
+    ],
+    key=["BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def solve_tril_16x16_kernel(
     A,
@@ -69,14 +70,15 @@ def solve_tril_16x16_kernel(
     )
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [1, 2, 4, 8]
-#         for num_stages in [2, 3, 4, 5]
-#     ],
-#     key=["H", "BT", "IS_VARLEN"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=2, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+    ],
+    key=["BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_32x32_inverse_kernel(
     A,
@@ -148,14 +150,15 @@ def merge_16x16_to_32x32_inverse_kernel(
     )
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4, 8]
-#         for num_stages in [2, 3, 4, 5]
-#     ],
-#     key=["H", "BT", "IS_VARLEN"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=2, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+    ],
+    key=["BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def merge_16x16_to_64x64_inverse_kernel(
     A,
@@ -432,8 +435,6 @@ def solve_tril(
         H=H,
         BT=BT,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=1,
-        num_stages=4,
     )
     if BT == 16:
         return Ad
@@ -458,7 +459,5 @@ def solve_tril(
         H=H,
         BT=BT,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=3,
     )
     return Ai

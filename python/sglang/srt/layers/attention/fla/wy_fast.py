@@ -11,14 +11,17 @@ import triton.language as tl
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4, 8]
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=3),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 128, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
+    ],
+    key=["K", "V", "BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
     k,
@@ -124,8 +127,6 @@ def recompute_w_u_fwd(
         prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BK = 64
-    BV = 64
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
     recompute_w_u_fwd_kernel[(NT, B * H)](
@@ -144,11 +145,7 @@ def recompute_w_u_fwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=4,
-        num_stages=3,
     )
     return w, u
 

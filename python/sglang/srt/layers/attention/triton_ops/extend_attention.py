@@ -216,6 +216,19 @@ def build_unified_kv_indices(
     return unified_kv_indptr, unified_kv_indices, prefix_lens
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+    ],
+    key=["BLOCK_DMODEL", "BLOCK_DPE", "BLOCK_DV"],
+)
 @triton.jit
 def _fwd_kernel(
     Q_Extend,
@@ -584,8 +597,9 @@ def extend_attention_fwd(
         v_extend.shape[-1],
     )
 
-    # Get block sizes and configuration
-    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
+    # BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV are determined by head dimensions.
+    # BLOCK_M, BLOCK_N, num_warps, num_stages are autotuned.
+    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, _, _, _ = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
 
@@ -594,17 +608,12 @@ def extend_attention_fwd(
     kv_group_num = q_extend.shape[1] // k_extend.shape[1]
 
     USE_CUSTOM_MASK = custom_mask is not None
-    # Skip custom mask for prefix part
     SKIP_PREFIX_CUSTOM_MASK = skip_prefix_custom_mask
 
     HAS_SINK = sinks is not None
 
-    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
-
-    extra_kargs = {}
-    if _is_hip:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+    def grid(meta):
+        return (batch_size, head_num, triton.cdiv(max_len_extend, meta["BLOCK_M"]))
 
     _fwd_kernel[grid](
         q_extend,
@@ -642,8 +651,6 @@ def extend_attention_fwd(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         Lq=Lq,
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
@@ -651,9 +658,6 @@ def extend_attention_fwd(
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
         STORE_TRANSPOSE=_is_hip,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **extra_kargs,
     )
 
 
@@ -694,6 +698,19 @@ def redundant_attention(
         pt += cur_seq_len_extend
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=1),
+    ],
+    key=["BLOCK_DMODEL", "BLOCK_DPE", "BLOCK_DV"],
+)
 @triton.jit
 def _fwd_kernel_unified(
     Q,
@@ -995,8 +1012,7 @@ def extend_attention_fwd_unified(
     """
     Lq, Lv = q.shape[-1], v_buffer.shape[-1]
 
-    # Get block sizes and configuration
-    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
+    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, _, _, _ = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
 
@@ -1007,18 +1023,11 @@ def extend_attention_fwd_unified(
     USE_CUSTOM_MASK = custom_mask is not None
     HAS_SINK = sinks is not None
 
-    # For sliding window attention, window_start_pos tracks the absolute position
-    # of the first key in each sequence's window
     if sliding_window_size > 0 and window_start_pos is None:
-        # If not provided, assume window starts at position 0
         window_start_pos = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
 
-    grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
-
-    extra_kargs = {}
-    if _is_hip:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+    def grid(meta):
+        return (batch_size, head_num, triton.cdiv(max_len_extend, meta["BLOCK_M"]))
 
     _fwd_kernel_unified[grid](
         q,
@@ -1050,14 +1059,9 @@ def extend_attention_fwd_unified(
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         Lq=Lq,
         Lv=Lv,
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         HAS_SINK=HAS_SINK,
-        num_warps=num_warps,
-        num_stages=num_stages,
-        **extra_kargs,
     )
