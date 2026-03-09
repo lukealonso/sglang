@@ -111,6 +111,14 @@ class HybridAttnBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 
+    def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
+        backend = (
+            self.decode_backend
+            if self.model_runner.server_args.speculative_attention_mode == "decode"
+            else self.prefill_backend
+        )
+        return backend.update_mamba_state_after_mtp_verify(*args, **kwargs)
+
     def forward(
         self,
         q: Optional[torch.Tensor] = None,  # For full attention
