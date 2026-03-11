@@ -121,6 +121,7 @@ def apply_pcie_allreduce_fusion(batch_size: int):
     ca_comm = get_tp_group().ca_comm
     return (
         _is_cuda
+        and get_global_server_args().enable_pcie_oneshot_allreduce_fusion
         and ca_comm is not None
         and not getattr(ca_comm, "disabled", True)
         and not getattr(ca_comm, "full_nvlink", True)

@@ -3,6 +3,7 @@
 import ctypes
 import logging
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, List, Optional, Union
 
@@ -59,6 +60,21 @@ def _can_p2p(rank: int, world_size: int) -> bool:
         if not gpu_p2p_access_check(rank, i):
             return False
     return True
+
+
+_PCIE_BENCHMARK_CEILING = 1024 * 1024  # 1MB upper bound for crossover sweep.
+
+
+def parse_pcie_ar_max_size(value: str) -> Optional[int]:
+    """Parse --pcie-oneshot-allreduce-max-size into bytes, or None for 'auto'."""
+    if value.lower() == "auto":
+        return None
+    v = value.upper().strip()
+    suffixes = {"K": 1024, "KB": 1024, "M": 1024 * 1024, "MB": 1024 * 1024}
+    for suffix, mult in sorted(suffixes.items(), key=lambda x: -len(x[0])):
+        if v.endswith(suffix):
+            return int(v[: -len(suffix)]) * mult
+    return int(value)
 
 
 class CustomAllreduce:
@@ -156,13 +172,25 @@ class CustomAllreduce:
             full_nvlink = is_full_nvlink(physical_device_ids, world_size)
 
         if world_size > 2 and not full_nvlink:
-            if _is_cuda:
+            from sglang.srt.server_args import get_global_server_args
+
+            sa = get_global_server_args()
+            if _is_cuda and sa.enable_pcie_oneshot_allreduce:
+                explicit_size = parse_pcie_ar_max_size(
+                    sa.pcie_oneshot_allreduce_max_size
+                )
+                if explicit_size is not None:
+                    max_size = min(max_size, explicit_size)
+                    self._needs_crossover_bench = False
+                else:
+                    max_size = min(max_size, _PCIE_BENCHMARK_CEILING)
+                    self._needs_crossover_bench = True
+
                 log_info_on_rank0(
                     logger,
-                    "PCIe topology detected with P2P support. "
-                    "Enabling oneshot custom allreduce for small messages.",
+                    "PCIe oneshot allreduce enabled "
+                    f"(max_size={'auto' if self._needs_crossover_bench else max_size}).",
                 )
-                max_size = min(max_size, 64 * 1024)
             else:
                 logger.warning(
                     "Custom allreduce is disabled because it's not supported on"
@@ -388,6 +416,85 @@ class CustomAllreduce:
             return False
 
         return False
+
+    def find_crossover_size(self, nccl_group) -> int:
+        """Benchmark custom AR vs NCCL at doubling sizes to find the crossover.
+
+        Sets self.max_size to the largest message size (bytes) where custom AR
+        is still faster than NCCL. All ranks must call this collectively.
+        """
+        WARMUP = 50
+        ITERS = 200
+
+        sizes = []
+        b = 1024
+        while b <= _PCIE_BENCHMARK_CEILING:
+            sizes.append(b)
+            b *= 2
+
+        dev = self.device
+        results = []
+
+        for size_bytes in sizes:
+            numel = size_bytes // 2  # bf16
+            inp = torch.ones(numel, dtype=torch.bfloat16, device=dev)
+            out = torch.zeros_like(inp)
+
+            for _ in range(WARMUP):
+                self.all_reduce(inp, out=out)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(ITERS):
+                self.all_reduce(inp, out=out)
+            torch.cuda.synchronize()
+            custom_us = (time.perf_counter() - t0) / ITERS * 1e6
+
+            inp2 = torch.ones(numel, dtype=torch.bfloat16, device=dev)
+            for _ in range(WARMUP):
+                dist.all_reduce(inp2, group=nccl_group)
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(ITERS):
+                dist.all_reduce(inp2, group=nccl_group)
+            torch.cuda.synchronize()
+            nccl_us = (time.perf_counter() - t0) / ITERS * 1e6
+
+            winner = "custom" if custom_us < nccl_us else "NCCL"
+            results.append((size_bytes, custom_us, nccl_us, winner))
+
+        crossover = 0
+        for size_bytes, custom_us, nccl_us, winner in results:
+            if winner == "custom":
+                crossover = size_bytes
+        if crossover == 0:
+            crossover = 1024
+
+        self.max_size = crossover
+
+        def fmt_size(b):
+            if b >= 1024 * 1024:
+                return f"{b // (1024*1024)}MB"
+            if b >= 1024:
+                return f"{b // 1024}KB"
+            return f"{b}B"
+
+        if self.rank == 0:
+            lines = [
+                f"[PCIe oneshot allreduce] Crossover benchmark "
+                f"({self.world_size} GPUs, bf16):"
+            ]
+            for size_bytes, custom_us, nccl_us, winner in results:
+                lines.append(
+                    f"  {fmt_size(size_bytes):>6s}:  custom {custom_us:6.1f} us  "
+                    f"vs  NCCL {nccl_us:6.1f} us  -> {winner} wins"
+                )
+            lines.append(
+                f"  Setting max_size = {fmt_size(crossover)} "
+                f"(last size where custom AR wins)"
+            )
+            log_info_on_rank0(logger, "\n".join(lines))
+
+        return crossover
 
     # all reduce, assuming inp tensor is IPC registered with register_buffer,
     # or, in the context of cuda graphs, register_graph_buffers

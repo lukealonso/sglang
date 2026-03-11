@@ -383,6 +383,13 @@ class GroupCoordinator:
                     "warning, specify --disable-custom-all-reduce explicitly."
                 )
 
+            if (
+                self.ca_comm is not None
+                and not self.ca_comm.disabled
+                and getattr(self.ca_comm, "_needs_crossover_bench", False)
+            ):
+                self.ca_comm.find_crossover_size(self.device_group)
+
             if is_hip():
                 try:
                     # Initialize a custom quick all-reduce implementation for AMD

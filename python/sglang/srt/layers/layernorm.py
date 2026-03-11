@@ -327,15 +327,24 @@ class RMSNorm(MultiPlatformOp):
                     )
                     if fused_result is not None:
                         return fused_result
-                else:
-                    fused_result = flashinfer_allreduce_residual_rmsnorm(
-                        input_tensor=x,
-                        residual=residual,
-                        weight=self.weight,
-                        eps=self.variance_epsilon,
+                elif _is_flashinfer_available:
+                    from sglang.srt.layers.flashinfer_comm_fusion import (
+                        _flashinfer_comm,
+                        _workspace_manager,
                     )
-                    if fused_result[0] is not None:
-                        return fused_result
+
+                    if (
+                        _flashinfer_comm is not None
+                        and _workspace_manager.initialized
+                    ):
+                        fused_result = flashinfer_allreduce_residual_rmsnorm(
+                            input_tensor=x,
+                            residual=residual,
+                            weight=self.weight,
+                            eps=self.variance_epsilon,
+                        )
+                        if fused_result[0] is not None:
+                            return fused_result
 
                 # PCIe fused allreduce+RMSNorm (routes through ca_comm).
                 fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
