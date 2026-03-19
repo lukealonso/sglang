@@ -19,6 +19,7 @@ class Fp4GemmRunnerBackend(Enum):
     FLASHINFER_CUDNN = "flashinfer_cudnn"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    B12X = "b12x"
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
@@ -31,6 +32,9 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_flashinfer_trtllm(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_TRTLLM
+
+    def is_b12x(self) -> bool:
+        return self == Fp4GemmRunnerBackend.B12X
 
     def get_flashinfer_backend(self) -> str:
         """Get the backend string to pass to FlashInfer's mm_fp4 API.
