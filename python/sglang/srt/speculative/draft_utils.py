@@ -55,6 +55,7 @@ class DraftBackendFactory:
             "trtllm_mla": self._create_trtllm_mla_decode_backend,
             "nsa": self._create_nsa_decode_backend,
             "ascend": self._create_ascend_decode_backend,
+            "b12x": self._create_triton_decode_backend,
         }
 
         return self._create_backend(
@@ -79,6 +80,7 @@ class DraftBackendFactory:
             "trtllm_mla": self._create_trtllm_mla_prefill_backend,
             "nsa": self._create_nsa_prefill_backend,
             "ascend": self._create_ascend_prefill_backend,
+            "b12x": self._create_triton_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"

@@ -29,6 +29,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
     get_moe_expert_parallel_world_size,
     get_pp_group,
+    get_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
@@ -44,6 +45,7 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_allocation_symmetric,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -56,6 +58,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -77,6 +80,9 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -92,6 +98,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
+_logged_b12x_sparse_fastpath = False
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -289,10 +296,91 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         return final_hidden_states
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
+        sparse_output = self._forward_router_experts_b12x(hidden_states)
+        if sparse_output is not None:
+            return sparse_output
+
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         return self.experts(hidden_states, topk_output)
+
+    def _forward_router_experts_b12x(
+        self, hidden_states: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        global _logged_b12x_sparse_fastpath
+        if not (_is_cuda and get_moe_runner_backend().is_b12x()):
+            return None
+
+        topk_config = self.topk.topk_config
+        if (
+            topk_config.use_grouped_topk
+            or topk_config.num_fused_shared_experts != 0
+            or topk_config.custom_routing_function is not None
+            or topk_config.correction_bias is not None
+            or topk_config.apply_routed_scaling_factor_on_output
+            or topk_config.scoring_func != "softmax"
+        ):
+            return None
+
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            _get_b12x_workspace_pool,
+        )
+
+        required_attrs = (
+            "w13_input_scale_quant",
+            "w13_weight",
+            "w13_blockscale_swizzled",
+            "g1_alphas",
+            "w2_input_scale_quant",
+            "w2_weight",
+            "w2_blockscale_swizzled",
+            "g2_alphas",
+        )
+        if not all(hasattr(self.experts, attr) for attr in required_attrs):
+            return None
+
+        from b12x.integration.tp_moe import B12XFP4ExpertWeights, b12x_sparse_moe_fp4
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            symm_output = torch.empty(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+
+        experts = B12XFP4ExpertWeights(
+            a1_gscale=self.experts.w13_input_scale_quant,
+            w1_fp4=self.experts.w13_weight,
+            w1_blockscale=self.experts.w13_blockscale_swizzled,
+            w1_alphas=self.experts.g1_alphas,
+            a2_gscale=self.experts.w2_input_scale_quant,
+            w2_fp4=self.experts.w2_weight,
+            w2_blockscale=self.experts.w2_blockscale_swizzled,
+            w2_alphas=self.experts.g2_alphas,
+        )
+        if not _logged_b12x_sparse_fastpath:
+            logger.info(
+                "Qwen b12x sparse fast path active: tokens=%d top_k=%d",
+                hidden_states.shape[0],
+                topk_config.top_k,
+            )
+            _logged_b12x_sparse_fastpath = True
+        return b12x_sparse_moe_fp4(
+            hidden_states,
+            experts=experts,
+            workspace=_get_b12x_workspace_pool(hidden_states.device),
+            top_k=topk_config.top_k,
+            gate_weight=self.gate.weight,
+            gate_bias=getattr(self.gate, "bias", None),
+            renormalize_topk=topk_config.renormalize,
+            output=symm_output,
+            input_scales_are_reciprocal=True,
+            input_scales_static=True,
+        )
 
     def forward_normal_dual_stream(
         self,
